@@ -1,0 +1,14 @@
+[Unit]
+Description=Flock You Surveillance Detector
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/admin/flock-you/api
+ExecStart=/home/admin/flock-you/api/venv/bin/python /home/admin/flock-you/api/flockyou.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

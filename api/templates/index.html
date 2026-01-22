@@ -1856,6 +1856,24 @@
                     console.log('Status loaded:', data);
                     updateFlockStatus(data.flock_connected);
                     updateGpsStatus(data.gps_connected);
+
+                    const flockSelect = document.getElementById('flockDeviceSelect');
+                    if (data.flock_connected && data.flock_port && !flockSelect.value) {
+                        const flockOptionExists = Array.from(flockSelect.options)
+                            .some(option => option.value === data.flock_port);
+                        if (flockOptionExists) {
+                            flockSelect.value = data.flock_port;
+                        }
+                    }
+
+                    const gpsSelect = document.getElementById('gpsPortSelect');
+                    if (data.gps_connected && data.gps_port && !gpsSelect.value) {
+                        const gpsOptionExists = Array.from(gpsSelect.options)
+                            .some(option => option.value === data.gps_port);
+                        if (gpsOptionExists) {
+                            gpsSelect.value = data.gps_port;
+                        }
+                    }
                     
                     if (data.flock_connected) {
                         document.getElementById('connectFlockBtn').style.display = 'none';

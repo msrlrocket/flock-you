@@ -12,6 +12,7 @@ import queue
 import uuid
 import pickle
 from pathlib import Path
+import led_controller
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'flockyou_dev_key_2024')
@@ -39,6 +40,10 @@ connection_lock = threading.Lock()
 serial_queue = queue.Queue()
 next_detection_id = 1  # Unique ID counter
 settings = {'gps_port': '', 'flock_port': '', 'filter': 'all'}
+
+# Auto-connect device identifiers (VID, PID)
+FLOCK_DEVICE_IDS = [(12346, 4097)]  # Espressif ESP32
+GPS_DEVICE_IDS = [(5446, 423)]       # u-blox GPS
 
 # Data storage paths
 DATA_DIR = Path('data')
@@ -465,6 +470,9 @@ def add_detection_from_serial(data):
         # Emit updated detection
         safe_socket_emit('detection_updated', existing_detection)
         print(f"Updated detection: MAC {mac_address}, Count: {existing_detection['detection_count']}, Method: {existing_detection.get('detection_method')}")
+
+        # Update LED heartbeat tracking for updated detection
+        led_controller.update_last_detection_time()
     else:
         # Create new detection
         data['id'] = next_detection_id
@@ -483,6 +491,9 @@ def add_detection_from_serial(data):
         # Emit to connected clients
         safe_socket_emit('new_detection', data)
         print(f"New detection added: ID {data['id']}, Method: {data.get('detection_method')}, MAC: {mac_address}")
+
+        # Trigger LED visual alert for new detection
+        led_controller.detection_alert()
 
 def connection_monitor():
     """Background thread for monitoring device connections"""
@@ -626,6 +637,51 @@ def attempt_reconnect_gps():
     
     thread = threading.Thread(target=reconnect_thread, daemon=True)
     thread.start()
+
+def auto_connect_devices():
+    """Auto-detect and connect to Flock sniffer and GPS on startup"""
+    global flock_device_connected, flock_device_port, flock_serial_connection
+    global serial_connection, gps_enabled
+
+    flock_port = None
+    gps_port = None
+
+    # Scan for devices
+    for port in serial.tools.list_ports.comports():
+        if (port.vid, port.pid) in FLOCK_DEVICE_IDS:
+            flock_port = port.device
+        elif (port.vid, port.pid) in GPS_DEVICE_IDS:
+            gps_port = port.device
+
+    # Connect Flock first (required)
+    if flock_port:
+        try:
+            flock_serial_connection = serial.Serial(flock_port, 115200, timeout=1)
+            with connection_lock:
+                flock_device_connected = True
+            flock_device_port = flock_port
+            flock_thread = threading.Thread(target=flock_reader, daemon=True)
+            flock_thread.start()
+            print(f"Auto-connected to Flock sniffer on {flock_port}")
+            time.sleep(1)  # Brief delay before GPS
+        except Exception as e:
+            print(f"Failed to auto-connect Flock: {e}")
+    else:
+        print("Flock sniffer not detected")
+
+    # Connect GPS second
+    if gps_port:
+        try:
+            serial_connection = serial.Serial(gps_port, GPS_BAUDRATE, timeout=GPS_TIMEOUT)
+            with connection_lock:
+                gps_enabled = True
+            gps_thread = threading.Thread(target=gps_reader, daemon=True)
+            gps_thread.start()
+            print(f"Auto-connected to GPS on {gps_port}")
+        except Exception as e:
+            print(f"Failed to auto-connect GPS: {e}")
+    else:
+        print("GPS dongle not detected")
 
 @app.route('/')
 def index():
@@ -1285,15 +1341,24 @@ if __name__ == '__main__':
     load_oui_database()
     load_cumulative_detections()
     load_settings()
-    
+
+    # Initialize NeoPixel LEDs (runs boot sequence: purple -> green)
+    led_controller.init_leds()
+
+    # Signal WiFi connected (blue blink for 5 seconds)
+    led_controller.wifi_connected()
+
+    # Auto-connect to Flock sniffer and GPS
+    auto_connect_devices()
+
     # Start connection monitor thread
     monitor_thread = threading.Thread(target=connection_monitor, daemon=True)
     monitor_thread.start()
-    
+
     # Start heartbeat thread
     heartbeat_thread = threading.Thread(target=send_heartbeat, daemon=True)
     heartbeat_thread.start()
-    
+
     print("Starting Flock You API server...")
     print("Server will be available at: http://localhost:5000")
     print("Press Ctrl+C to stop the server")
@@ -1302,6 +1367,8 @@ if __name__ == '__main__':
         socketio.run(app, debug=False, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
     except KeyboardInterrupt:
         print("\nShutting down server...")
+        # Clean up LED controller
+        led_controller.cleanup()
         # Clean up connections
         if flock_serial_connection and flock_serial_connection.is_open:
             flock_serial_connection.close()
