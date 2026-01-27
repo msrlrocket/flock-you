@@ -689,6 +689,29 @@
             box-shadow: 0 0 8px rgba(16, 185, 129, 0.6);
         }
 
+        .gps-fix-info {
+            font-size: 0.7rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            margin-left: 0.5rem;
+            font-weight: 600;
+        }
+
+        .gps-fix-info.fix-3d {
+            background: #10b981;
+            color: white;
+        }
+
+        .gps-fix-info.fix-2d {
+            background: #f59e0b;
+            color: white;
+        }
+
+        .gps-fix-info.no-fix {
+            background: #dc2626;
+            color: white;
+        }
+
         .device-info {
             font-size: 0.8rem;
             color: #d1d5db;
@@ -1311,8 +1334,9 @@
                         </div>
                         <button id="connectGpsBtn">Connect</button>
                         <button id="disconnectGpsBtn" class="danger" style="display: none;">Disconnect</button>
+                        <span id="gpsFixInfo" class="gps-fix-info" style="display: none;"></span>
                     </div>
-                    
+
                     <div class="control-group">
                         <label>Filter:</label>
                         <select id="filterSelect">
@@ -2154,10 +2178,45 @@
 
         socket.on('gps_update', function(gpsData) {
             console.log('GPS Update:', gpsData);
+            updateGpsFixInfo(gpsData);
         });
+
+        function updateGpsFixInfo(gpsData) {
+            const fixInfo = document.getElementById('gpsFixInfo');
+            if (!fixInfo) return;
+
+            const fixQuality = gpsData.fix_quality || 0;
+            const satellites = gpsData.satellites || 0;
+
+            if (fixQuality >= 1) {
+                // Color based on satellite count
+                // 8+ sats: green (excellent), 5-7: yellow (good), <5: red (poor)
+                let fixClass;
+
+                if (satellites >= 8) {
+                    fixClass = 'fix-3d';  // green
+                } else if (satellites >= 5) {
+                    fixClass = 'fix-2d';  // yellow
+                } else {
+                    fixClass = 'no-fix';  // red
+                }
+
+                const fixText = `GPS Locked (${satellites} sats)`;
+
+                fixInfo.textContent = fixText;
+                fixInfo.className = 'gps-fix-info ' + fixClass;
+                fixInfo.style.display = 'inline-block';
+            } else {
+                fixInfo.textContent = 'No GPS Fix';
+                fixInfo.className = 'gps-fix-info no-fix';
+                fixInfo.style.display = 'inline-block';
+            }
+        }
 
         socket.on('gps_disconnected', function() {
             console.log('GPS disconnected');
+            const fixInfo = document.getElementById('gpsFixInfo');
+            if (fixInfo) fixInfo.style.display = 'none';
             updateGpsStatus(false);
             const connectBtn = document.getElementById('connectGpsBtn');
             const disconnectBtn = document.getElementById('disconnectGpsBtn');

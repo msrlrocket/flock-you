@@ -2,7 +2,7 @@ from flask import Flask, render_template, request, jsonify, send_file
 import json
 import csv
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import threading
@@ -12,7 +12,16 @@ import queue
 import uuid
 import pickle
 from pathlib import Path
+from dotenv import load_dotenv
 import led_controller
+
+# Load environment variables from .env file (project root)
+load_dotenv(Path(__file__).parent.parent / '.env')
+
+# GPS configuration from environment
+GPS_SOURCE = os.environ.get('GPS_SOURCE', 'serial')  # 'serial' or 'gpsd'
+GPSD_HOST = os.environ.get('GPSD_HOST', 'localhost')
+GPSD_PORT = int(os.environ.get('GPSD_PORT', 2947))
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'flockyou_dev_key_2024')
@@ -41,9 +50,15 @@ serial_queue = queue.Queue()
 next_detection_id = 1  # Unique ID counter
 settings = {'gps_port': '', 'flock_port': '', 'filter': 'all'}
 
-# Auto-connect device identifiers (VID, PID)
-FLOCK_DEVICE_IDS = [(12346, 4097)]  # Espressif ESP32
-GPS_DEVICE_IDS = [(5446, 423)]       # u-blox GPS
+# Auto-connect device identifiers (VID, PID) - can be overridden via environment
+FLOCK_DEVICE_IDS = [(
+    int(os.environ.get('FLOCK_DEVICE_VID', 12346)),
+    int(os.environ.get('FLOCK_DEVICE_PID', 4097))
+)]  # Espressif ESP32
+GPS_DEVICE_IDS = [(
+    int(os.environ.get('GPS_DEVICE_VID', 5446)),
+    int(os.environ.get('GPS_DEVICE_PID', 423))
+)]  # u-blox GPS
 
 # Data storage paths
 DATA_DIR = Path('data')
@@ -132,6 +147,233 @@ def lookup_manufacturer(mac_address):
 # GPS Dongle Configuration
 GPS_BAUDRATE = 9600
 GPS_TIMEOUT = 1
+GPS_FRESHNESS_THRESHOLD = 60  # Max age in seconds for GPS data to be considered fresh
+
+
+class GPSDSerialAdapter:
+    """
+    Adapter that mimics a serial port interface but talks to gpsd via pygpsd.
+    Returns NMEA-formatted sentences so existing parsing code works unchanged.
+
+    Uses pygpsd library (pip install pygpsd) which supports Python 3.10-3.13.
+    """
+
+    def __init__(self, host='localhost', port=2947):
+        self.host = host
+        self._port_num = port
+        self._gpsd = None
+        self._is_open = False
+        self._lock = threading.Lock()
+        self._last_sat_count = 0
+        self._sat_fetch_thread = None
+        self._sat_fetch_running = False
+
+    @property
+    def is_open(self):
+        return self._is_open
+
+    @property
+    def port(self):
+        """Return a descriptive port string for gpsd connection"""
+        return f"gpsd://{self.host}:{self._port_num}"
+
+    @property
+    def in_waiting(self):
+        """Mimic serial.in_waiting to test connection"""
+        return 1 if self._is_open else 0
+
+    def _satellite_fetcher(self):
+        """Background thread to fetch satellite count from gpsd"""
+        import socket
+        import json
+
+        while self._sat_fetch_running:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5)
+                sock.connect((self.host, self._port_num))
+                sock.send(b'?WATCH={"enable":true,"json":true};')
+
+                buffer = b''
+                while self._sat_fetch_running:
+                    try:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        buffer += chunk
+
+                        # Process complete lines
+                        while b'\n' in buffer:
+                            line, buffer = buffer.split(b'\n', 1)
+                            try:
+                                data = json.loads(line.decode())
+                                if data.get('class') == 'SKY' and 'uSat' in data:
+                                    self._last_sat_count = data.get('uSat', 0)
+                            except:
+                                pass
+                    except socket.timeout:
+                        continue
+
+                sock.close()
+            except Exception as e:
+                print(f"GPSDSerialAdapter: Satellite fetcher error: {e}")
+                time.sleep(5)
+
+    def open(self):
+        """Connect to gpsd"""
+        try:
+            from pygpsd import GPSD
+            self._gpsd = GPSD(host=self.host, port=self._port_num)
+            # Test connection with a poll
+            self._gpsd.poll()
+            self._is_open = True
+            print(f"GPSDSerialAdapter: Connected to gpsd at {self.host}:{self.port}")
+
+            # Start satellite fetcher thread
+            self._sat_fetch_running = True
+            self._sat_fetch_thread = threading.Thread(target=self._satellite_fetcher, daemon=True)
+            self._sat_fetch_thread.start()
+
+            return True
+        except ImportError:
+            print("GPSDSerialAdapter: pygpsd library not available. Install with: pip install pygpsd")
+            return False
+        except Exception as e:
+            print(f"GPSDSerialAdapter: Failed to connect to gpsd: {e}")
+            return False
+
+    def close(self):
+        """Disconnect from gpsd"""
+        self._sat_fetch_running = False
+        self._gpsd = None
+        self._is_open = False
+        print("GPSDSerialAdapter: Disconnected from gpsd")
+
+    def readline(self):
+        """Read GPS data from gpsd, returning NMEA-formatted sentence as bytes"""
+        if not self._is_open or not self._gpsd:
+            return b''
+
+        try:
+            from pygpsd import GPSInactiveWarning, NoGPSDeviceFoundException
+
+            try:
+                data = self._gpsd.poll()
+            except NoGPSDeviceFoundException:
+                print("GPSDSerialAdapter: No GPS device found")
+                return b''
+            except GPSInactiveWarning:
+                # GPS exists but no fix yet
+                return b''
+
+            # Check if we have valid position data
+            # pygpsd structure: data.geo.position.latitude/longitude/altitude
+            if data.geo and data.geo.position and data.geo.position.latitude is not None and data.geo.position.longitude is not None:
+                lat = data.geo.position.latitude
+                lon = data.geo.position.longitude
+                alt = data.geo.position.altitude if data.geo.position.altitude is not None else 0
+
+                # Convert to NMEA format (DDMM.MMMM)
+                lat_abs = abs(lat)
+                lon_abs = abs(lon)
+                lat_dir = 'N' if lat >= 0 else 'S'
+                lon_dir = 'E' if lon >= 0 else 'W'
+
+                lat_deg = int(lat_abs)
+                lat_min = (lat_abs - lat_deg) * 60
+                lon_deg = int(lon_abs)
+                lon_min = (lon_abs - lon_deg) * 60
+
+                # Get time from gpsd data or use current UTC
+                # pygpsd: data.time.time is the datetime object
+                if data.time and data.time.time:
+                    time_str = data.time.time.strftime('%H%M%S')
+                else:
+                    time_str = datetime.now(timezone.utc).strftime('%H%M%S')
+
+                # Get satellite count from background fetcher
+                sats = self._last_sat_count
+
+                # Construct GNGGA sentence (compatible with existing parser)
+                # Fix quality: 1 = GPS fix, mode.value >= 2 means 2D or 3D fix
+                fix_quality = 1 if data.mode and data.mode.value >= 2 else 0
+
+                nmea = f"$GNGGA,{time_str}.00,{lat_deg:02d}{lat_min:07.4f},{lat_dir},{lon_deg:03d}{lon_min:07.4f},{lon_dir},{fix_quality},{sats:02d},1.0,{alt:.1f},M,0.0,M,,*00"
+                return (nmea + '\r\n').encode('utf-8')
+
+            return b''
+
+        except Exception as e:
+            print(f"GPSDSerialAdapter: Read error: {e}")
+            return b''
+
+
+def is_gps_fresh(gps_entry, max_age_seconds=GPS_FRESHNESS_THRESHOLD):
+    """
+    Check if GPS NMEA timestamp is recent (not stale cached data).
+
+    Args:
+        gps_entry: GPS data dict with 'timestamp' (NMEA HHMMSS.SS format) and 'system_timestamp'
+        max_age_seconds: Maximum age in seconds for data to be considered fresh
+
+    Returns:
+        bool: True if GPS data is fresh, False if stale or invalid
+    """
+    if not gps_entry:
+        return False
+
+    try:
+        # First check system_timestamp if available (most reliable)
+        system_ts = gps_entry.get('system_timestamp')
+        if system_ts:
+            age = time.time() - system_ts
+            if age > max_age_seconds:
+                print(f"GPS staleness: system_timestamp is {age:.1f}s old (threshold: {max_age_seconds}s)")
+                return False
+            return True
+
+        # Fallback: Parse NMEA timestamp (HHMMSS.SS format in UTC)
+        nmea_ts = gps_entry.get('timestamp')
+        if not nmea_ts:
+            print("GPS staleness: No timestamp available")
+            return False
+
+        # Parse NMEA time (HHMMSS or HHMMSS.SS)
+        nmea_ts = str(nmea_ts)
+        if '.' in nmea_ts:
+            nmea_ts = nmea_ts.split('.')[0]
+
+        if len(nmea_ts) < 6:
+            print(f"GPS staleness: Invalid NMEA timestamp format: {nmea_ts}")
+            return False
+
+        hours = int(nmea_ts[0:2])
+        minutes = int(nmea_ts[2:4])
+        seconds = int(nmea_ts[4:6])
+
+        # Get current UTC time
+        now_utc = datetime.now(timezone.utc)
+
+        # Construct GPS time for today
+        gps_time = now_utc.replace(hour=hours, minute=minutes, second=seconds, microsecond=0)
+
+        # Handle day boundary (GPS time might be from yesterday if we're near midnight)
+        time_diff = (now_utc - gps_time).total_seconds()
+        if time_diff < -43200:  # More than 12 hours in the future = yesterday's data
+            time_diff += 86400
+        elif time_diff > 43200:  # More than 12 hours in the past = tomorrow (unlikely)
+            time_diff -= 86400
+
+        if abs(time_diff) > max_age_seconds:
+            print(f"GPS staleness: NMEA timestamp is {abs(time_diff):.1f}s old (threshold: {max_age_seconds}s)")
+            return False
+
+        return True
+
+    except Exception as e:
+        print(f"GPS staleness check error: {e}")
+        return False
+
 
 class GPSData:
     def __init__(self):
@@ -240,7 +482,7 @@ def gps_reader():
                         
                         # Also send parsed GPS data to terminal
                         if parsed.get('fix_quality') > 0:
-                            gps_info = f"GPS Fix: {parsed.get('latitude', 'N/A')}, {parsed.get('longitude', 'N/A')} - {parsed.get('satellites', 0)} satellites"
+                            gps_info = f"GPS Fix: {parsed.get('latitude', 'N/A')}, {parsed.get('longitude', 'N/A')}"
                             safe_socket_emit('serial_data', gps_info, room='serial_terminal')
             except Exception as e:
                 print(f"GPS read error: {e}")
@@ -369,44 +611,55 @@ def add_detection_from_serial(data):
         # Validate GPS data before using it
         is_valid, validation_msg = validate_gps_data(best_gps)
         if is_valid:
-            time_diff = abs(system_time - best_gps['system_timestamp'])
-            data['gps'] = {
-                'latitude': best_gps.get('latitude'),
-                'longitude': best_gps.get('longitude'),
-                'altitude': best_gps.get('altitude'),
-                'timestamp': best_gps.get('timestamp'),
-                'satellites': best_gps.get('satellites'),
-                'fix_quality': best_gps.get('fix_quality'),
-                'time_diff': time_diff,
-                'match_quality': 'temporal'
-            }
-            # Prefer GPS timestamp when available and accurate
-            if time_diff < 5:  # Very close temporal match
-                preferred_timestamp = best_gps.get('timestamp')
-                print(f"✓ Using GPS timestamp for MAC {data.get('mac_address', 'unknown')}: {time_diff:.2f}s difference")
+            # Check GPS freshness to avoid stale cached data
+            if not is_gps_fresh(best_gps):
+                print(f"⚠ Rejecting stale GPS data for MAC {data.get('mac_address', 'unknown')}")
+                data['gps_stale'] = True
+                best_gps = None
             else:
-                print(f"✓ GPS temporal match for MAC {data.get('mac_address', 'unknown')}: {time_diff:.2f}s difference")
+                time_diff = abs(system_time - best_gps['system_timestamp'])
+                data['gps'] = {
+                    'latitude': best_gps.get('latitude'),
+                    'longitude': best_gps.get('longitude'),
+                    'altitude': best_gps.get('altitude'),
+                    'timestamp': best_gps.get('timestamp'),
+                    'satellites': best_gps.get('satellites'),
+                    'fix_quality': best_gps.get('fix_quality'),
+                    'time_diff': time_diff,
+                    'match_quality': 'temporal'
+                }
+                # Prefer GPS timestamp when available and accurate
+                if time_diff < 5:  # Very close temporal match
+                    preferred_timestamp = best_gps.get('timestamp')
+                    print(f"✓ Using GPS timestamp for MAC {data.get('mac_address', 'unknown')}: {time_diff:.2f}s difference")
+                else:
+                    print(f"✓ GPS temporal match for MAC {data.get('mac_address', 'unknown')}: {time_diff:.2f}s difference")
         else:
             print(f"⚠ Invalid GPS data for temporal match: {validation_msg}")
             best_gps = None
-    
+
     # Fallback to current GPS if no good temporal match
     if not best_gps and gps_data and gps_data.get('fix_quality') > 0:
         is_valid, validation_msg = validate_gps_data(gps_data)
         if is_valid:
-            data['gps'] = {
-                'latitude': gps_data.get('latitude'),
-                'longitude': gps_data.get('longitude'),
-                'altitude': gps_data.get('altitude'),
-                'timestamp': gps_data.get('timestamp'),
-                'satellites': gps_data.get('satellites'),
-                'fix_quality': gps_data.get('fix_quality'),
-                'time_diff': None,  # Unknown time difference
-                'match_quality': 'current'
-            }
-            # Use current GPS timestamp if available
-            preferred_timestamp = gps_data.get('timestamp')
-            print(f"○ Using current GPS timestamp for MAC {data.get('mac_address', 'unknown')} (no temporal match)")
+            # Check GPS freshness to avoid stale cached data
+            if not is_gps_fresh(gps_data):
+                print(f"⚠ Rejecting stale current GPS data for MAC {data.get('mac_address', 'unknown')}")
+                data['gps_stale'] = True
+            else:
+                data['gps'] = {
+                    'latitude': gps_data.get('latitude'),
+                    'longitude': gps_data.get('longitude'),
+                    'altitude': gps_data.get('altitude'),
+                    'timestamp': gps_data.get('timestamp'),
+                    'satellites': gps_data.get('satellites'),
+                    'fix_quality': gps_data.get('fix_quality'),
+                    'time_diff': None,  # Unknown time difference
+                    'match_quality': 'current'
+                }
+                # Use current GPS timestamp if available
+                preferred_timestamp = gps_data.get('timestamp')
+                print(f"○ Using current GPS timestamp for MAC {data.get('mac_address', 'unknown')} (no temporal match)")
         else:
             print(f"⚠ Current GPS data invalid: {validation_msg}")
     
@@ -471,8 +724,12 @@ def add_detection_from_serial(data):
         safe_socket_emit('detection_updated', existing_detection)
         print(f"Updated detection: MAC {mac_address}, Count: {existing_detection['detection_count']}, Method: {existing_detection.get('detection_method')}")
 
-        # Update LED heartbeat tracking for updated detection
-        led_controller.update_last_detection_time()
+        # Trigger LED visual alert for re-detection
+        led_controller.detection_alert(
+            protocol=data.get('protocol'),
+            detection_method=data.get('detection_method'),
+            is_new=False
+        )
     else:
         # Create new detection
         data['id'] = next_detection_id
@@ -493,7 +750,11 @@ def add_detection_from_serial(data):
         print(f"New detection added: ID {data['id']}, Method: {data.get('detection_method')}, MAC: {mac_address}")
 
         # Trigger LED visual alert for new detection
-        led_controller.detection_alert()
+        led_controller.detection_alert(
+            protocol=data.get('protocol'),
+            detection_method=data.get('detection_method'),
+            is_new=True
+        )
 
 def connection_monitor():
     """Background thread for monitoring device connections"""
@@ -669,19 +930,41 @@ def auto_connect_devices():
     else:
         print("Flock sniffer not detected")
 
-    # Connect GPS second
-    if gps_port:
+    # Connect GPS - try gpsd first if configured, fall back to serial
+    gps_connected = False
+
+    if GPS_SOURCE == 'gpsd':
+        print(f"GPS_SOURCE is 'gpsd', attempting to connect to gpsd at {GPSD_HOST}:{GPSD_PORT}")
+        try:
+            gpsd_adapter = GPSDSerialAdapter(host=GPSD_HOST, port=GPSD_PORT)
+            if gpsd_adapter.open():
+                serial_connection = gpsd_adapter
+                with connection_lock:
+                    gps_enabled = True
+                gps_thread = threading.Thread(target=gps_reader, daemon=True)
+                gps_thread.start()
+                print(f"Auto-connected to GPS via gpsd at {GPSD_HOST}:{GPSD_PORT}")
+                gps_connected = True
+            else:
+                print("Failed to connect to gpsd, will try serial fallback")
+        except Exception as e:
+            print(f"Failed to connect to gpsd: {e}, will try serial fallback")
+
+    # Fall back to serial GPS if gpsd not configured or failed
+    if not gps_connected and gps_port:
         try:
             serial_connection = serial.Serial(gps_port, GPS_BAUDRATE, timeout=GPS_TIMEOUT)
             with connection_lock:
                 gps_enabled = True
             gps_thread = threading.Thread(target=gps_reader, daemon=True)
             gps_thread.start()
-            print(f"Auto-connected to GPS on {gps_port}")
+            print(f"Auto-connected to GPS on serial port {gps_port}")
+            gps_connected = True
         except Exception as e:
-            print(f"Failed to auto-connect GPS: {e}")
-    else:
-        print("GPS dongle not detected")
+            print(f"Failed to auto-connect GPS via serial: {e}")
+
+    if not gps_connected:
+        print("GPS not detected (no gpsd or serial device available)")
 
 @app.route('/')
 def index():
@@ -826,6 +1109,19 @@ def get_status():
 def get_gps_ports():
     """Get available serial ports for GPS"""
     ports = []
+
+    # Add gpsd as a virtual port option when GPS_SOURCE is 'gpsd'
+    if GPS_SOURCE == 'gpsd':
+        ports.append({
+            'device': f'gpsd://{GPSD_HOST}:{GPSD_PORT}',
+            'description': f'gpsd daemon at {GPSD_HOST}:{GPSD_PORT}',
+            'manufacturer': 'gpsd',
+            'product': 'GPS Daemon (Multi-App Support)',
+            'vid': None,
+            'pid': None,
+            'is_gpsd': True
+        })
+
     for port in serial.tools.list_ports.comports():
         port_info = {
             'device': port.device,
@@ -833,7 +1129,8 @@ def get_gps_ports():
             'manufacturer': port.manufacturer if port.manufacturer else 'Unknown',
             'product': port.product if port.product else 'Unknown',
             'vid': port.vid,
-            'pid': port.pid
+            'pid': port.pid,
+            'is_gpsd': False
         }
         ports.append(port_info)
     return jsonify(ports)

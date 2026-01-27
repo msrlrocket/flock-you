@@ -4,6 +4,7 @@
 #include <NimBLEScan.h>
 #include <NimBLEAdvertisedDevice.h>
 #include <ArduinoJson.h>
+#include <FastLED.h>
 #include <string.h>
 #include <ctype.h>
 #include <stdio.h>
@@ -17,6 +18,8 @@
 
 // Hardware Configuration
 #define BUZZER_PIN 3  // GPIO3 (D2) - PWM capable pin on Xiao ESP32 S3
+#define LED_PIN 48    // GPIO48 - Built-in WS2812 LED on Xiao ESP32 S3
+#define NUM_LEDS 1    // Single built-in LED
 
 // Audio Configuration
 #define LOW_FREQ 200      // Boot sequence - low pitch
@@ -134,12 +137,28 @@ static bool device_in_range = false;
 static unsigned long last_detection_time = 0;
 static unsigned long last_heartbeat = 0;
 static NimBLEScan* pBLEScan;
+static bool in_heartbeat_mode = false;  // Track if we've switched to heartbeat/purple mode
+
+// LED array for WS2812
+static CRGB leds[NUM_LEDS];
+
+// Time threshold to switch from active detection (red) to heartbeat mode (purple)
+#define HEARTBEAT_MODE_THRESHOLD 5000  // 5 seconds without new detection
 
 
 
 // ============================================================================
-// AUDIO SYSTEM
+// AUDIO & LED SYSTEM
 // ============================================================================
+
+void flash_led_red(int duration_ms)
+{
+    leds[0] = CRGB::Red;
+    FastLED.show();
+    delay(duration_ms);
+    leds[0] = CRGB::Black;
+    FastLED.show();
+}
 
 void beep(int frequency, int duration_ms)
 {
@@ -149,35 +168,77 @@ void beep(int frequency, int duration_ms)
 
 void boot_beep_sequence()
 {
-    printf("Initializing audio system...\n");
-    printf("Playing boot sequence: Low -> High pitch\n");
+    printf("Initializing audio/LED system...\n");
+    printf("Playing boot sequence: Low -> High pitch with LED animation\n");
+
+    // Boot animation: cycle through colors with beeps
+    leds[0] = CRGB::Blue;
+    FastLED.show();
     beep(LOW_FREQ, BOOT_BEEP_DURATION);
+
+    leds[0] = CRGB::Green;
+    FastLED.show();
     beep(HIGH_FREQ, BOOT_BEEP_DURATION);
-    printf("Audio system ready\n\n");
+
+    // Quick RGB flash to indicate ready
+    for (int i = 0; i < 2; i++) {
+        leds[0] = CRGB::Red;
+        FastLED.show();
+        delay(50);
+        leds[0] = CRGB::Green;
+        FastLED.show();
+        delay(50);
+        leds[0] = CRGB::Blue;
+        FastLED.show();
+        delay(50);
+    }
+
+    leds[0] = CRGB::Black;
+    FastLED.show();
+    printf("Audio/LED system ready\n\n");
 }
 
 void flock_detected_beep_sequence()
 {
     printf("FLOCK SAFETY DEVICE DETECTED!\n");
-    printf("Playing alert sequence: 3 fast high-pitch beeps\n");
+    printf("Playing alert sequence: 3 fast high-pitch beeps with LED flash\n");
     for (int i = 0; i < 3; i++) {
+        leds[0] = CRGB::Red;
+        FastLED.show();
         beep(DETECT_FREQ, DETECT_BEEP_DURATION);
+        leds[0] = CRGB::Black;
+        FastLED.show();
         if (i < 2) delay(50); // Short gap between beeps
     }
-    printf("Detection complete - device identified!\n\n");
-    
+
+    // Keep LED solid red while actively detecting
+    leds[0] = CRGB::Red;
+    FastLED.show();
+    printf("Detection complete - LED red while actively detecting\n\n");
+
     // Mark device as in range and start heartbeat tracking
     device_in_range = true;
+    in_heartbeat_mode = false;  // Reset - we're actively detecting
     last_detection_time = millis();
     last_heartbeat = millis();
 }
 
 void heartbeat_pulse()
 {
-    printf("Heartbeat: Device still in range\n");
+    printf("Heartbeat: Device in range but not actively detected\n");
+
+    // Pulse LED off briefly then back to purple with each beep
+    leds[0] = CRGB::Black;
+    FastLED.show();
     beep(HEARTBEAT_FREQ, HEARTBEAT_DURATION);
+    leds[0] = CRGB::Purple;
+    FastLED.show();
     delay(100);
+    leds[0] = CRGB::Black;
+    FastLED.show();
     beep(HEARTBEAT_FREQ, HEARTBEAT_DURATION);
+    leds[0] = CRGB::Purple;
+    FastLED.show();
 }
 
 // ============================================================================
@@ -673,7 +734,13 @@ void setup()
 {
     Serial.begin(115200);
     delay(1000);
-    
+
+    // Initialize WS2812 LED
+    FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
+    FastLED.setBrightness(50);  // Set brightness (0-255)
+    leds[0] = CRGB::Black;
+    FastLED.show();
+
     // Initialize buzzer
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
@@ -716,18 +783,32 @@ void loop()
     // Handle heartbeat pulse if device is in range
     if (device_in_range) {
         unsigned long now = millis();
-        
-        // Check if 10 seconds have passed since last heartbeat
-        if (now - last_heartbeat >= 10000) {
+        unsigned long time_since_detection = now - last_detection_time;
+
+        // Check if we should switch from active (red) to heartbeat mode (purple)
+        if (!in_heartbeat_mode && time_since_detection >= HEARTBEAT_MODE_THRESHOLD) {
+            printf("Switching to heartbeat mode - LED purple\n");
+            in_heartbeat_mode = true;
+            leds[0] = CRGB::Purple;
+            FastLED.show();
+        }
+
+        // Check if 10 seconds have passed since last heartbeat (only in heartbeat mode)
+        if (in_heartbeat_mode && (now - last_heartbeat >= 10000)) {
             heartbeat_pulse();
             last_heartbeat = now;
         }
-        
+
         // Check if device has gone out of range (no detection for 30 seconds)
-        if (now - last_detection_time >= 30000) {
-            printf("Device out of range - stopping heartbeat\n");
+        if (time_since_detection >= 30000) {
+            printf("Device out of range - stopping heartbeat, turning off LED\n");
             device_in_range = false;
+            in_heartbeat_mode = false;
             triggered = false; // Allow new detections
+
+            // Turn off LED
+            leds[0] = CRGB::Black;
+            FastLED.show();
         }
     }
     

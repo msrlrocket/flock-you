@@ -1,11 +1,48 @@
-
+# PlatformIO
 .pio/
 
+# IDE
 .vscode/
 
+# macOS
 .DS_Store
 
+# Claude/AI tools
 .claude/
 .codex/
 CLAUDE.md
 AGENTS.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+ENV/
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+
+# Flask/App data (runtime generated)
+api/data/
+api/exports/
+
+# Logs
+*.log
+
+# Environment variables
+.env
+.env.local
+*.env
+
+# Pickle files (data persistence)
+*.pkl
+
+# Local customizations (optional, remove comment to track)
+# local/

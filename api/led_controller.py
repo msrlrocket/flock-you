@@ -1,6 +1,6 @@
 """
 NeoPixel LED Controller for Flock You
-Visual alerts mirroring ESP32 firmware audio patterns
+Visual alerts with device-type differentiation and detection patterns
 """
 
 import os
@@ -13,20 +13,24 @@ import shutil
 # Configuration
 LED_PIN = 18
 LED_COUNT = 2
-HEARTBEAT_INTERVAL = 5   # seconds between pulses
-RANGE_TIMEOUT = 30       # seconds until "out of range"
-WIFI_CHECK_INTERVAL = 5  # seconds between WiFi checks
+HEARTBEAT_INTERVAL = 10   # seconds between pulses (changed from 5)
+RANGE_TIMEOUT = 30        # seconds until "out of range"
+WIFI_CHECK_INTERVAL = 5   # seconds between WiFi checks
 WIFI_BLINK_COUNT = 3
 WIFI_BLINK_ON = 0.2
 WIFI_BLINK_OFF = 0.2
+SCANNING_PULSE_INTERVAL = 10  # seconds between scanning pulses
 
-# Colors (GRB format for NeoPixels)
+# Colors (RGB format - NeoPixel library handles GRB conversion via pixel_order)
 COLOR_OFF = (0, 0, 0)
-COLOR_RED = (0, 255, 0)
-COLOR_GREEN = (255, 0, 0)
+COLOR_RED = (255, 0, 0)
+COLOR_GREEN = (0, 255, 0)
 COLOR_BLUE = (0, 0, 255)
-COLOR_PURPLE = (0, 128, 128)
+COLOR_PURPLE = (128, 0, 128)
 COLOR_YELLOW = (255, 255, 0)
+COLOR_AMBER = (255, 191, 0)
+COLOR_ORANGE = (255, 165, 0)
+COLOR_WHITE = (255, 255, 255)
 
 # State
 last_detection_time = 0
@@ -34,12 +38,15 @@ _heartbeat_thread = None
 _heartbeat_running = False
 _wifi_monitor_thread = None
 _wifi_monitor_running = False
+_scanning_thread = None
+_scanning_running = False
 _pixels = None
 _is_raspberry_pi = False
 _out_of_range_signaled = False
 _last_wifi_connected = None
 _last_wifi_ssid = None
 _wifi_iface = None
+_alert_lock = threading.Lock()  # Prevent overlapping LED patterns
 
 
 def _is_running_on_pi():
@@ -148,6 +155,31 @@ def _get_wifi_ssid(iface):
     return None
 
 
+def _set_pixel(index, color):
+    """Set a single pixel to a color"""
+    global _pixels
+    if _pixels is None or index >= LED_COUNT:
+        return
+    try:
+        _pixels[index] = color
+        _pixels.show()
+    except Exception as e:
+        print(f"LED set pixel error: {e}")
+
+
+def _set_all_pixels(color):
+    """Set all pixels to the same color"""
+    global _pixels
+    if _pixels is None:
+        return
+    try:
+        for i in range(LED_COUNT):
+            _pixels[i] = color
+        _pixels.show()
+    except Exception as e:
+        print(f"LED set color error: {e}")
+
+
 def _blink(color, count=1, on_time=0.2, off_time=0.2):
     if _pixels is None:
         return
@@ -162,17 +194,24 @@ def _blink(color, count=1, on_time=0.2, off_time=0.2):
         print(f"LED blink error: {e}")
 
 
-def _set_all_pixels(color):
-    """Set all pixels to the same color"""
-    global _pixels
+def _sequential_blink(color, count=1, on_time=0.15, off_time=0.1):
+    """Sequential L->R->L blink pattern for WiFi events"""
     if _pixels is None:
         return
     try:
-        for i in range(LED_COUNT):
-            _pixels[i] = color
-        _pixels.show()
+        for _ in range(count):
+            # Left LED
+            _set_pixel(0, color)
+            time.sleep(on_time)
+            _set_pixel(0, COLOR_OFF)
+            time.sleep(off_time)
+            # Right LED
+            _set_pixel(1, color)
+            time.sleep(on_time)
+            _set_pixel(1, COLOR_OFF)
+            time.sleep(off_time)
     except Exception as e:
-        print(f"LED set color error: {e}")
+        print(f"LED sequential blink error: {e}")
 
 
 def _fade_transition(from_color, to_color, steps=20, delay=0.05):
@@ -193,10 +232,78 @@ def _fade_transition(from_color, to_color, steps=20, delay=0.05):
         print(f"LED fade error: {e}")
 
 
+def _fade_in(color, steps=20, delay=0.05):
+    """Fade in from off to color"""
+    _fade_transition(COLOR_OFF, color, steps, delay)
+
+
+def _fade_out(color, steps=20, delay=0.05):
+    """Fade out from color to off"""
+    _fade_transition(color, COLOR_OFF, steps, delay)
+
+
+def _device_type_indication(protocol, detection_method):
+    """Show device type indication after main alert"""
+    if _pixels is None:
+        return
+
+    try:
+        time.sleep(0.3)  # Brief pause after main alert
+
+        if protocol == 'wifi':
+            # WiFi: Left=Blue, Right=Orange
+            _set_pixel(0, COLOR_BLUE)
+            _set_pixel(1, COLOR_ORANGE)
+        elif protocol in ['bluetooth_le', 'bluetooth_classic']:
+            # BLE: Left=Green, Right=Orange
+            _set_pixel(0, COLOR_GREEN)
+            _set_pixel(1, COLOR_ORANGE)
+        else:
+            # Unknown: Both amber
+            _set_all_pixels(COLOR_AMBER)
+
+        time.sleep(0.5)
+        _set_all_pixels(COLOR_OFF)
+    except Exception as e:
+        print(f"LED device type indication error: {e}")
+
+
+def _raven_alert():
+    """Special alert for Raven gunshot detectors - red/white strobe"""
+    if _pixels is None:
+        return
+
+    try:
+        for _ in range(4):
+            _set_all_pixels(COLOR_RED)
+            time.sleep(0.1)
+            _set_all_pixels(COLOR_WHITE)
+            time.sleep(0.1)
+        _set_all_pixels(COLOR_OFF)
+    except Exception as e:
+        print(f"LED raven alert error: {e}")
+
+
+def _scanning_pulse():
+    """Dim green pulse to indicate active scanning"""
+    if _pixels is None:
+        return
+
+    try:
+        # Dim green glow
+        dim_green = (0, 50, 0)  # Very dim green
+        _fade_in(dim_green, steps=10, delay=0.03)
+        time.sleep(0.2)
+        _fade_out(dim_green, steps=10, delay=0.03)
+    except Exception as e:
+        print(f"LED scanning pulse error: {e}")
+
+
 def init_leds():
-    """Initialize NeoPixel LEDs and run boot sequence (purple->green)"""
+    """Initialize NeoPixel LEDs and run boot sequence (yellow fade-in)"""
     global _pixels, _is_raspberry_pi, _heartbeat_running, _heartbeat_thread
     global _wifi_monitor_running, _wifi_monitor_thread, _wifi_iface
+    global _scanning_running, _scanning_thread
 
     _is_raspberry_pi = _is_running_on_pi()
 
@@ -218,18 +325,21 @@ def init_leds():
 
         print("LED Controller: Initialized on GPIO18")
 
-        # Boot sequence: Purple -> Green transition
-        print("LED Controller: Running boot sequence (purple -> green)")
-        _set_all_pixels(COLOR_PURPLE)
+        # Boot sequence: Yellow fade-in
+        print("LED Controller: Running boot sequence (yellow fade-in)")
+        _fade_in(COLOR_YELLOW, steps=30, delay=0.03)
         time.sleep(0.5)
-        _fade_transition(COLOR_PURPLE, COLOR_GREEN, steps=30, delay=0.03)
-        time.sleep(0.5)
-        _set_all_pixels(COLOR_OFF)
+        _fade_out(COLOR_YELLOW, steps=20, delay=0.03)
 
         # Start heartbeat thread
         _heartbeat_running = True
         _heartbeat_thread = threading.Thread(target=_heartbeat_worker, daemon=True)
         _heartbeat_thread.start()
+
+        # Start scanning pulse thread
+        _scanning_running = True
+        _scanning_thread = threading.Thread(target=_scanning_worker, daemon=True)
+        _scanning_thread.start()
 
         _wifi_monitor_running = True
         _wifi_iface = _detect_wifi_interface()
@@ -260,31 +370,40 @@ def wifi_connected():
         return
 
     print("LED Controller: WiFi connected - blue blink")
-    thread = threading.Thread(
-        target=_blink,
-        kwargs={"color": COLOR_BLUE, "count": WIFI_BLINK_COUNT, "on_time": WIFI_BLINK_ON, "off_time": WIFI_BLINK_OFF},
-        daemon=True
-    )
+
+    def worker():
+        with _alert_lock:
+            _sequential_blink(COLOR_BLUE, count=WIFI_BLINK_COUNT, on_time=WIFI_BLINK_ON, off_time=WIFI_BLINK_OFF)
+
+    thread = threading.Thread(target=worker, daemon=True)
     thread.start()
 
 
 def wifi_disconnected():
-    """Purple triple blink when WiFi disconnects"""
+    """Amber triple blink when WiFi disconnects"""
     if not _is_raspberry_pi or _pixels is None:
         print("LED Controller: WiFi disconnected (stub)")
         return
 
-    print("LED Controller: WiFi disconnected - purple blink")
-    thread = threading.Thread(
-        target=_blink,
-        kwargs={"color": COLOR_PURPLE, "count": WIFI_BLINK_COUNT, "on_time": WIFI_BLINK_ON, "off_time": WIFI_BLINK_OFF},
-        daemon=True
-    )
+    print("LED Controller: WiFi disconnected - amber blink")
+
+    def worker():
+        with _alert_lock:
+            _blink(COLOR_AMBER, count=WIFI_BLINK_COUNT, on_time=WIFI_BLINK_ON, off_time=WIFI_BLINK_OFF)
+
+    thread = threading.Thread(target=worker, daemon=True)
     thread.start()
 
 
-def detection_alert():
-    """Red triple blink on new detection"""
+def detection_alert(protocol=None, detection_method=None, is_new=True):
+    """
+    Visual alert for detection events.
+
+    Args:
+        protocol: 'wifi', 'bluetooth_le', 'bluetooth_classic', etc.
+        detection_method: 'probe_request', 'beacon', 'raven_service_uuid', etc.
+        is_new: True for new detection, False for re-detection
+    """
     global _pixels, _is_raspberry_pi, last_detection_time, _out_of_range_signaled
 
     # Update last detection time for heartbeat tracking
@@ -292,30 +411,47 @@ def detection_alert():
     _out_of_range_signaled = False
 
     if not _is_raspberry_pi or _pixels is None:
-        print("LED Controller: Detection alert (stub)")
+        print(f"LED Controller: Detection alert (stub) - protocol={protocol}, method={detection_method}, is_new={is_new}")
         return
 
-    print("LED Controller: Detection alert - red blink")
+    print(f"LED Controller: Detection alert - protocol={protocol}, method={detection_method}, is_new={is_new}")
 
     def flash_worker():
-        try:
-            _blink(COLOR_RED, count=3, on_time=0.15, off_time=0.1)
-        except Exception as e:
-            print(f"LED Controller: Detection flash error: {e}")
+        with _alert_lock:
+            try:
+                # Special handling for Raven gunshot detectors
+                if detection_method == 'raven_service_uuid':
+                    _raven_alert()
+                elif is_new:
+                    # New detection: Long red flashes x5 (0.4s on)
+                    _blink(COLOR_RED, count=5, on_time=0.4, off_time=0.2)
+                else:
+                    # Re-detection: Fast double-flash x3
+                    for _ in range(3):
+                        _blink(COLOR_RED, count=2, on_time=0.1, off_time=0.05)
+                        time.sleep(0.2)
+
+                # Show device type indication after main alert
+                if protocol:
+                    _device_type_indication(protocol, detection_method)
+
+            except Exception as e:
+                print(f"LED Controller: Detection flash error: {e}")
 
     thread = threading.Thread(target=flash_worker, daemon=True)
     thread.start()
 
 
 def heartbeat_pulse():
-    """Red double pulse for in-range heartbeat"""
+    """Orange double pulse for in-range heartbeat"""
     global _pixels, _is_raspberry_pi
 
     if not _is_raspberry_pi or _pixels is None:
         return
 
     try:
-        _blink(COLOR_RED, count=2, on_time=0.2, off_time=0.15)
+        with _alert_lock:
+            _blink(COLOR_ORANGE, count=2, on_time=0.2, off_time=0.15)
     except Exception as e:
         print(f"LED Controller: Heartbeat pulse error: {e}")
 
@@ -327,7 +463,8 @@ def out_of_range_alert():
         return
 
     print("LED Controller: Out of range - yellow blink")
-    _blink(COLOR_YELLOW, count=3, on_time=0.2, off_time=0.15)
+    with _alert_lock:
+        _blink(COLOR_YELLOW, count=3, on_time=0.2, off_time=0.15)
 
 
 def _heartbeat_worker():
@@ -360,6 +497,32 @@ def _heartbeat_worker():
         except Exception as e:
             print(f"LED Controller: Heartbeat worker error: {e}")
             time.sleep(1)
+
+
+def _scanning_worker():
+    """Background thread for scanning pulse when idle"""
+    global _scanning_running, last_detection_time
+
+    while _scanning_running:
+        try:
+            now = time.time()
+            time_since_detection = now - last_detection_time
+
+            # Only show scanning pulse when NOT in range (no recent detection)
+            # Skip if we're within RANGE_TIMEOUT of a detection (heartbeat is active)
+            if last_detection_time == 0 or time_since_detection >= RANGE_TIMEOUT:
+                # Only pulse if we can acquire the lock (don't block other alerts)
+                if _alert_lock.acquire(blocking=False):
+                    try:
+                        _scanning_pulse()
+                    finally:
+                        _alert_lock.release()
+
+            time.sleep(SCANNING_PULSE_INTERVAL)
+
+        except Exception as e:
+            print(f"LED Controller: Scanning worker error: {e}")
+            time.sleep(SCANNING_PULSE_INTERVAL)
 
 
 def _wifi_monitor_worker():
@@ -413,12 +576,13 @@ def clear_leds():
 
 def cleanup():
     """Clean up LED resources on shutdown"""
-    global _heartbeat_running, _wifi_monitor_running, _pixels, _is_raspberry_pi
+    global _heartbeat_running, _wifi_monitor_running, _scanning_running, _pixels, _is_raspberry_pi
 
     print("LED Controller: Cleaning up")
 
     _heartbeat_running = False
     _wifi_monitor_running = False
+    _scanning_running = False
 
     if _is_raspberry_pi and _pixels is not None:
         try:
